@@ -16,6 +16,7 @@ from PIL import Image
 import time
 import os
 import io
+import re
 import tempfile
 import hashlib
 import random
@@ -40,21 +41,37 @@ DEFAULT_VISION = "qwen/qwen3-vl-8b"
 # No longer checking SDK compatibility
 
 # --- Helper for SDK-native reasoning stripping via respond_stream ---
+_THINK_TAG_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+
+def _strip_think_tags(text: str) -> str:
+    """Remove all <think>...</think> blocks and strip surrounding whitespace."""
+    return _THINK_TAG_RE.sub('', text).strip()
+
 def _collect_response(model_obj, chat, config, strip_thinking):
     """
     Call respond_stream and collect response fragments.
-    When strip_thinking is True, only fragments with reasoning_type == 'none'
-    are included, natively excluding <think>...</think> blocks without regex.
+    When strip_thinking is True, attempts the SDK-native reasoning_type filter
+    first, then falls back to regex removal of <think>...</think> blocks.
     Returns (PredictionResult, content_string).
     """
     if strip_thinking:
         content_parts = []
+        sdk_filter_worked = False
         with model_obj.respond_stream(chat, config=config) as stream:
             for fragment in stream:
-                if fragment.reasoning_type == 'none':
+                rt = getattr(fragment, 'reasoning_type', None)
+                if rt is not None:
+                    sdk_filter_worked = True
+                    if rt == 'none':
+                        content_parts.append(fragment.content)
+                else:
                     content_parts.append(fragment.content)
             result = stream.result()
-        return result, ''.join(content_parts).strip()
+        text = ''.join(content_parts).strip()
+        # If the SDK didn't provide reasoning_type, strip tags with regex
+        if not sdk_filter_worked:
+            text = _strip_think_tags(text)
+        return result, text
     else:
         result = model_obj.respond(chat, config=config)
         return result, result.content
