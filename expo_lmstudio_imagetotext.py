@@ -36,6 +36,27 @@ DEFAULT_VISION = "qwen/qwen3-vl-8b"
 
 # No longer checking SDK compatibility
 
+# --- Helper for SDK-native reasoning stripping via respond_stream ---
+def _collect_response(model_obj, chat, config, strip_thinking):
+    """
+    Call respond_stream and collect response fragments.
+    When strip_thinking is True, only fragments with reasoning_type == 'none'
+    are included, natively excluding <think>...</think> blocks without regex.
+    Returns (PredictionResult, content_string).
+    """
+    if strip_thinking:
+        content_parts = []
+        with model_obj.respond_stream(chat, config=config) as stream:
+            for fragment in stream:
+                if fragment.reasoning_type == 'none':
+                    content_parts.append(fragment.content)
+            result = stream.result()
+        return result, ''.join(content_parts).strip()
+    else:
+        result = model_obj.respond(chat, config=config)
+        return result, result.content
+
+
 # --- Helper function to get model info with fallback ---
 def get_model_info_with_fallback(model_key, debug=False):
     """
@@ -205,6 +226,7 @@ class ExpoLmstudioUnified:
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
+                "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
             }
         }
 
@@ -214,7 +236,7 @@ class ExpoLmstudioUnified:
     CATEGORY = "ComfyExpo/LMStudio"
 
     @classmethod
-    def IS_CHANGED(cls, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300):
+    def IS_CHANGED(cls, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
         m = hashlib.sha256()
         
         m.update(str(text_input).encode())
@@ -227,6 +249,7 @@ class ExpoLmstudioUnified:
         m.update(str(temperature).encode())
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
+        m.update(str(strip_thinking).encode())
         
         # Include image hash if present
         if image is not None:
@@ -236,9 +259,10 @@ class ExpoLmstudioUnified:
         
         return m.hexdigest()
 
-    def process_input(self, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300):
+    def process_input(self, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
+        strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
         # Fail fast if LM Studio is not reachable
         check_lmstudio_connection()
 
@@ -324,9 +348,9 @@ class ExpoLmstudioUnified:
                     print(f"Debug: Sending request to LM Studio with config: {config}")
                 # --- Timeout logic ---
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(model.respond, chat, config=config)
+                    future = executor.submit(_collect_response, model, chat, config, strip_thinking)
                     try:
-                        result = future.result(timeout=timeout_seconds)
+                        result, output_text = future.result(timeout=timeout_seconds)
                     except concurrent.futures.TimeoutError:
                         error_message = f"Error: LM Studio model response timed out after {timeout_seconds} seconds."
                         print(error_message)
@@ -349,7 +373,7 @@ class ExpoLmstudioUnified:
                     except Exception as unload_err:
                         print(f"Warning: Failed to unload model: {unload_err}")
 
-                return (result.content,)
+                return (output_text,)
 
         except Exception as e:
             error_message = f"LM Studio error (Unified node): {str(e)}"
@@ -384,6 +408,7 @@ class ExpoLmstudioImageToText:
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
+                "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
                 # Legacy parameters for backward compatibility
                 "model": ("STRING", {"default": ""}),  # Old parameter name
                 "ip_address": ("STRING", {"default": ""}),  # Legacy HTTP mode
@@ -397,7 +422,7 @@ class ExpoLmstudioImageToText:
     CATEGORY = "ComfyExpo/I2T"
 
     @classmethod
-    def IS_CHANGED(cls, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, model="", ip_address="", port=0):
+    def IS_CHANGED(cls, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
         m = hashlib.sha256()
         
         m.update(str(user_prompt).encode())
@@ -410,6 +435,7 @@ class ExpoLmstudioImageToText:
         m.update(str(temperature).encode())
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
+        m.update(str(strip_thinking).encode())
         m.update(str(model).encode())
         m.update(str(ip_address).encode())
         m.update(str(port).encode())
@@ -421,7 +447,7 @@ class ExpoLmstudioImageToText:
         
         return m.hexdigest()
 
-    def process_image(self, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, model="", ip_address="", port=0):
+    def process_image(self, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
         # Handle backward compatibility
@@ -498,9 +524,9 @@ class ExpoLmstudioImageToText:
 
                 # Run with timeout
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(model_obj.respond, chat, config=config)
+                    future = executor.submit(_collect_response, model_obj, chat, config, strip_thinking)
                     try:
-                        result = future.result(timeout=timeout_seconds)
+                        result, output_text = future.result(timeout=timeout_seconds)
                     except concurrent.futures.TimeoutError:
                         error_message = f"Error: LM Studio model response timed out after {timeout_seconds} seconds."
                         print(error_message)
@@ -525,7 +551,7 @@ class ExpoLmstudioImageToText:
                     except Exception as unload_err:
                         print(f"Warning: Failed to unload model: {unload_err}")
 
-                return (result.content,)
+                return (output_text,)
 
         except Exception as e:
             error_message = f"LM Studio error (Image to Text node): {str(e)}"
@@ -641,6 +667,7 @@ class ExpoLmstudioTextGeneration:
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
+                "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
                 # Legacy parameters for backward compatibility
                 "model": ("STRING", {"default": ""}),  # Old parameter name
                 "ip_address": ("STRING", {"default": ""}),  # Legacy HTTP mode
@@ -654,7 +681,7 @@ class ExpoLmstudioTextGeneration:
     CATEGORY = "ComfyExpo/Text"
 
     @classmethod
-    def IS_CHANGED(cls, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, model="", ip_address="", port=0):
+    def IS_CHANGED(cls, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
         m = hashlib.sha256()
         
         m.update(str(prompt).encode())
@@ -667,15 +694,17 @@ class ExpoLmstudioTextGeneration:
         m.update(str(temperature).encode())
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
+        m.update(str(strip_thinking).encode())
         m.update(str(model).encode())
         m.update(str(ip_address).encode())
         m.update(str(port).encode())
         
         return m.hexdigest()
 
-    def generate_text(self, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, model="", ip_address="", port=0):
+    def generate_text(self, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
+        strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
         # Handle backward compatibility
         # If legacy parameters are provided, show a deprecation warning and try to use them
         if model and not model_key:
@@ -736,9 +765,9 @@ class ExpoLmstudioTextGeneration:
                     print(f"Debug: Sending request to LM Studio")
                 # --- Timeout logic ---
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(model_obj.respond, chat, config=config)
+                    future = executor.submit(_collect_response, model_obj, chat, config, strip_thinking)
                     try:
-                        result = future.result(timeout=timeout_seconds)
+                        result, output_text = future.result(timeout=timeout_seconds)
                     except concurrent.futures.TimeoutError:
                         error_message = f"Error: LM Studio model response timed out after {timeout_seconds} seconds."
                         print(error_message)
@@ -761,7 +790,7 @@ class ExpoLmstudioTextGeneration:
                     except Exception as unload_err:
                         print(f"Warning: Failed to unload model: {unload_err}")
 
-                return (result.content,)
+                return (output_text,)
 
         except Exception as e:
             error_message = f"LM Studio error (Text Generation node): {str(e)}"
@@ -879,6 +908,7 @@ class ExpoLmstudioStructuredOutput:
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
+                "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
             },
         }
 
@@ -890,11 +920,11 @@ class ExpoLmstudioStructuredOutput:
     @classmethod
     def IS_CHANGED(cls, text_input, json_schema, output_keys, system_prompt, model_key,
                    auto_unload, unload_delay, seed, image=None,
-                   max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300):
+                   max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
         import json as _json
         m = hashlib.sha256()
         for val in (text_input, json_schema, output_keys, system_prompt, model_key,
-                    auto_unload, unload_delay, seed, max_tokens, temperature, debug, timeout_seconds):
+                    auto_unload, unload_delay, seed, max_tokens, temperature, debug, timeout_seconds, strip_thinking):
             m.update(str(val).encode())
         if image is not None:
             m.update(np.array(image).tobytes())
@@ -903,10 +933,11 @@ class ExpoLmstudioStructuredOutput:
     def generate_structured(self, text_input, json_schema, output_keys, system_prompt,
                             model_key, auto_unload, unload_delay, seed,
                             image=None, max_tokens=1000, temperature=0.7,
-                            debug=False, timeout_seconds=300):
+                            debug=False, timeout_seconds=300, strip_thinking=True):
         import json as _json
 
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
+        strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
         check_lmstudio_connection()
 
         # Parse the schema
@@ -968,16 +999,16 @@ class ExpoLmstudioStructuredOutput:
                     print(f"Debug: [StructuredOutput] sending request with structured config")
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(model_obj.respond, chat, config=config)
+                    future = executor.submit(_collect_response, model_obj, chat, config, strip_thinking)
                     try:
-                        result = future.result(timeout=timeout_seconds)
+                        result, output_text = future.result(timeout=timeout_seconds)
                     except concurrent.futures.TimeoutError:
                         err = f"Error: LM Studio model response timed out after {timeout_seconds} seconds."
                         print(err)
                         empty = ("",) * 6
                         return (err,) + empty
 
-                json_string = result.content.strip()
+                json_string = output_text.strip()
 
                 if debug:
                     print(f"Debug: [StructuredOutput] raw response: {json_string[:200]}")
