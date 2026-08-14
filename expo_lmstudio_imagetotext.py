@@ -162,6 +162,32 @@ def get_model_info_with_fallback(model_key, debug=False):
         return None  # Let the client use default
 
 
+def _prepare_image_handles(client, image_batch, debug=False):
+    """
+    Convert a ComfyUI IMAGE batch (shape [B, H, W, C], values in [0,1]) into a
+    list of LM Studio image handles suitable for chat.add_user_message(images=...).
+    Every image in the batch is included, so a batched image input (e.g. from a
+    node that stacks multiple loaded images) results in multiple images being
+    sent to the model in a single message.
+
+    Returns (handles, temp_paths). The caller is responsible for deleting the
+    temp_paths once the request has completed.
+    """
+    handles = []
+    temp_paths = []
+    batch_size = image_batch.shape[0]
+    for i in range(batch_size):
+        pil_image = Image.fromarray(np.uint8(image_batch[i] * 255))
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
+            temp_path = temp_file.name
+            pil_image.save(temp_path, format="JPEG")
+        temp_paths.append(temp_path)
+        if debug:
+            print(f"Debug: Saved image {i + 1}/{batch_size} to temporary file: {temp_path}")
+        handles.append(client.files.prepare_image(temp_path))
+    return handles, temp_paths
+
+
 def check_lmstudio_connection():
     """
     Verify that LM Studio is reachable before attempting generation.
@@ -306,7 +332,7 @@ class ExpoLmstudioUnified:
             print(f"Debug: Requested Model: {model_key}")
             print(f"Debug: Auto unload: {auto_unload}, Unload delay: {unload_delay}s")
 
-        managed_temp_path = [None]
+        managed_temp_paths = []
         timed_out = [False]
 
         def do_the_work():
@@ -328,30 +354,19 @@ class ExpoLmstudioUnified:
 
                 # Process inputs
                 if has_image:
-                    # Convert numpy array to PIL Image
-                    pil_image = Image.fromarray(np.uint8(image[0]*255))
-
-                    # Create a temporary file
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
-                        managed_temp_path[0] = temp_file.name
-                        # Save to the temporary file
-                        pil_image.save(managed_temp_path[0], format="JPEG")
-
-                    if debug:
-                        print(f"Debug: Saved image to temporary file: {managed_temp_path[0]}")
-
-                    # Use the client's files namespace to prepare the image
-                    image_handle = client.files.prepare_image(managed_temp_path[0])
+                    # Convert every image in the batch to an LM Studio image handle
+                    image_handles, saved_paths = _prepare_image_handles(client, image, debug)
+                    managed_temp_paths.extend(saved_paths)
 
                     # Add user message with correct signature per SDK docs
                     if has_text:
-                        chat.add_user_message(text_input, images=[image_handle])
+                        chat.add_user_message(text_input, images=image_handles)
                         if debug:
-                            print(f"Debug: Added text and image to chat message")
+                            print(f"Debug: Added text and {len(image_handles)} image(s) to chat message")
                     else:
-                        chat.add_user_message(images=[image_handle])
+                        chat.add_user_message(images=image_handles)
                         if debug:
-                            print(f"Debug: Added image only to chat message")
+                            print(f"Debug: Added {len(image_handles)} image(s) only to chat message")
                 elif has_text:
                     # Add user message with text only
                     chat.add_user_message(text_input)
@@ -412,15 +427,16 @@ class ExpoLmstudioUnified:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-            # Clean up the temporary image file if it was created
-            temp_path = managed_temp_path[0]
-            if not timed_out[0] and temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                    if debug:
-                        print(f"Debug: Removed temporary file: {temp_path}")
-                except Exception as cleanup_err:
-                    print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
+            # Clean up any temporary image files that were created
+            if not timed_out[0]:
+                for temp_path in managed_temp_paths:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                            if debug:
+                                print(f"Debug: Removed temporary file: {temp_path}")
+                        except Exception as cleanup_err:
+                            print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
 
 
 class ExpoLmstudioImageToText:
@@ -510,7 +526,7 @@ class ExpoLmstudioImageToText:
             print(f"Debug: Auto unload: {auto_unload}, Unload delay: {unload_delay}s")
             print(f"Debug: Image shape: {image.shape}")
 
-        managed_temp_path = [None]
+        managed_temp_paths = []
         timed_out = [False]
 
         def do_the_work():
@@ -531,18 +547,13 @@ class ExpoLmstudioImageToText:
                 # Create chat and attach prompts
                 chat = lms.Chat(system_prompt)
 
-                # Prepare image and add to chat
+                # Prepare image(s) and add to chat
                 if image is not None:
-                    pil_image = Image.fromarray(np.uint8(image[0] * 255))
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                        managed_temp_path[0] = tmp.name
-                        pil_image.save(managed_temp_path[0], format='JPEG')
+                    image_handles, saved_paths = _prepare_image_handles(client, image, debug)
+                    managed_temp_paths.extend(saved_paths)
                     if debug:
-                        print(f"Debug: Saved image to temporary file: {managed_temp_path[0]}")
-
-                    # Use client.files.prepare_image
-                    image_handle = client.files.prepare_image(managed_temp_path[0])
-                    chat.add_user_message(user_prompt, images=[image_handle])
+                        print(f"Debug: Prepared {len(image_handles)} image(s) for chat message")
+                    chat.add_user_message(user_prompt, images=image_handles)
                 else:
                     chat.add_user_message(user_prompt)
 
@@ -603,15 +614,16 @@ class ExpoLmstudioImageToText:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-            # Clean up the temporary image file if it was created
-            temp_path = managed_temp_path[0]
-            if not timed_out[0] and temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                    if debug:
-                        print(f"Debug: Removed temporary file: {temp_path}")
-                except Exception as cleanup_err:
-                    print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
+            # Clean up any temporary image files that were created
+            if not timed_out[0]:
+                for temp_path in managed_temp_paths:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                            if debug:
+                                print(f"Debug: Removed temporary file: {temp_path}")
+                        except Exception as cleanup_err:
+                            print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
 
     def _process_image_legacy_http(self, image, user_prompt, system_prompt, model, ip_address, port, seed, max_tokens=1000, temperature=0.7, debug=False):
         """Legacy HTTP-based image processing for backward compatibility"""
@@ -635,13 +647,18 @@ class ExpoLmstudioImageToText:
             print(f"Debug: Image shape: {image.shape}")
 
         try:
-            # Convert numpy array to PIL Image
-            pil_image = Image.fromarray(np.uint8(image[0]*255))
+            # Convert every image in the batch to a base64 data URL
+            content = [{"type": "text", "text": user_prompt}]
+            batch_size = image.shape[0]
+            for i in range(batch_size):
+                pil_image = Image.fromarray(np.uint8(image[i] * 255))
+                buffered = io.BytesIO()
+                pil_image.save(buffered, format="JPEG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}})
 
-            # Convert to base64
-            buffered = io.BytesIO()
-            pil_image.save(buffered, format="JPEG")
-            img_str = base64.b64encode(buffered.getvalue()).decode()
+            if debug:
+                print(f"Debug: Encoded {batch_size} image(s) for legacy HTTP payload")
 
             # Prepare the payload
             payload = {
@@ -653,10 +670,8 @@ class ExpoLmstudioImageToText:
                     },
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": user_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}}
-                        ]}
+                        "content": content
+                    }
                 ],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -1014,7 +1029,7 @@ class ExpoLmstudioStructuredOutput:
             print(f"Debug: [StructuredOutput] model={model_key}, keys={keys}")
             print(f"Debug: [StructuredOutput] schema={_json.dumps(parsed_schema, indent=2)}")
 
-        managed_temp_path = [None]
+        managed_temp_paths = []
         timed_out = [False]
 
         def do_the_work():
@@ -1032,14 +1047,11 @@ class ExpoLmstudioStructuredOutput:
                 chat = lms.Chat(system_prompt)
 
                 if image is not None:
-                    pil_image = Image.fromarray(np.uint8(image[0] * 255))
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
-                        managed_temp_path[0] = tmp.name
-                        pil_image.save(managed_temp_path[0], format='JPEG')
-                    image_handle = client.files.prepare_image(managed_temp_path[0])
-                    chat.add_user_message(text_input, images=[image_handle])
+                    image_handles, saved_paths = _prepare_image_handles(client, image, debug)
+                    managed_temp_paths.extend(saved_paths)
+                    chat.add_user_message(text_input, images=image_handles)
                     if debug:
-                        print(f"Debug: [StructuredOutput] added image + text to chat")
+                        print(f"Debug: [StructuredOutput] added {len(image_handles)} image(s) + text to chat")
                 else:
                     chat.add_user_message(text_input)
 
@@ -1136,13 +1148,14 @@ class ExpoLmstudioStructuredOutput:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-            # Clean up the temporary image file if it was created
-            temp_path = managed_temp_path[0]
-            if not timed_out[0] and temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception as cleanup_err:
-                    print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
+            # Clean up any temporary image files that were created
+            if not timed_out[0]:
+                for temp_path in managed_temp_paths:
+                    if temp_path and os.path.exists(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                        except Exception as cleanup_err:
+                            print(f"Warning: Failed to remove temporary file {temp_path}: {cleanup_err}")
 
 
 NODE_CLASS_MAPPINGS = {
