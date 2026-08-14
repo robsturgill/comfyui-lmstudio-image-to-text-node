@@ -44,8 +44,7 @@ Here's an example of how the LM Studio nodes can be used in a ComfyUI workflow:
 2.  Clone this repository:
     ```bash
     cd /path/to/ComfyUI/custom_nodes
-    git clone [https://github.com/mattjohnpowell/comfyui-lmstudio-nodes.git](https://github.com/mattjohnpowell/comfyui-lmstudio-nodes.git) ComfyExpo-LMStudioNodes
-    # Using 'ComfyExpo-LMStudioNodes' as the directory name to avoid potential conflicts
+    git clone https://github.com/robsturgill/comfyui-lmstudio-image-to-text-node.git
     ```
 3.  **Install Dependencies:** Ensure the `lmstudio` package is installed in ComfyUI's Python environment:
     ```bash
@@ -93,6 +92,12 @@ When old parameters are detected, the nodes will:
 ## Usage
 
 Add the nodes to your workflow by right-clicking the canvas and searching for their names (e.g., "LM Studio Unified (Expo)").
+
+### Sending Multiple Images
+
+The `image` input on the Unified, Image to Text, and Structured Output nodes accepts a **batch** of images, not just a single one. Every image in the batch is sent to the model as part of the same message, so vision models that support multi-image prompts (e.g. comparing, summarizing, or describing several images together) can make use of all of them at once.
+
+To build a batch, feed multiple `LoadImage` nodes into a node that combines them along the batch dimension — e.g. ComfyUI's built-in **Batch Images** node (chained for 3+ images), or any "Load Image List"/"Image List to Batch" style node from a custom pack — and connect its output to the `image` input here. A single `LoadImage` node connected directly still works exactly as before (a batch of one).
 
 ---
 
@@ -300,7 +305,7 @@ If you encounter any issues:
 4.  Ensure the `model_key` you are providing exists in your LM Studio library and is compatible with the node's task (e.g., a vision model for the I2T node).
 5.  Confirm the `lmstudio` Python package is correctly installed in your ComfyUI environment.
 
-For further assistance, please open an issue on the GitHub repository: [https://github.com/mattjohnpowell/comfyui-lmstudio-nodes](https://github.com/mattjohnpowell/comfyui-lmstudio-nodes)
+For further assistance, please open an issue on the GitHub repository: [https://github.com/robsturgill/comfyui-lmstudio-image-to-text-node](https://github.com/robsturgill/comfyui-lmstudio-image-to-text-node)
 
 ## License
 
