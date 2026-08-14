@@ -6,7 +6,7 @@ license = { file = "LICENSE" }
 dependencies = ["lmstudio>=1.2.0"]
 
 [project.urls]
-Repository = "https://github.com/mattjohnpowell/comfyui-lmstudio-image-to-text-node"
+Repository = "https://github.com/robsturgill/comfyui-lmstudio-image-to-text-node"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
