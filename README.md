@@ -25,6 +25,7 @@ Here's an example of how the LM Studio nodes can be used in a ComfyUI workflow:
 
 -   Utilizes the official `lmstudio` Python SDK for robust connection and interaction.
 -   Supports text-only, image-only (vision), and combined text+image inputs.
+-   Accepts a batch of images on the `image` input (e.g. from an image-batching node) and sends all of them to the model in a single message, for models that support multi-image prompts.
 -   Identifies models using `model_key` strings (e.g., `llama-3.2-1b-instruct`).
 -   Provides dedicated nodes for specific tasks (Image-to-Text, Text Generation).
 -   Includes nodes for managing model memory (Load/Unload/List).
@@ -104,7 +105,7 @@ Handles text-only, image-only, or combined text+image generation.
 -   `model_key` (STRING, required): The key of the LM Studio model to use (e.g., `llama-3.2-1b-instruct` or a vision model key). Default: `llama-3.2-1b-instruct`.
 -   `system_prompt` (STRING, required): System prompt for the AI. Default: "You are a helpful AI assistant."
 -   `seed` (INT, required): Seed for reproducibility (-1 for random). Default: -1.
--   `image` (IMAGE, optional): Input image (requires a vision-capable `model_key`).
+-   `image` (IMAGE, optional): Input image or batch of images (requires a vision-capable `model_key`). When a batch is connected, every image in it is sent to the model in the same message.
 -   `text_input` (STRING, optional): Text prompt. Default: "".
 -   `max_tokens` (INT, optional): Max tokens for the response. Default: 1000.
 -   `temperature` (FLOAT, optional): Generation temperature. Default: 0.7.
@@ -127,7 +128,7 @@ Generates text descriptions for images using vision models.
 -   `model_key` (STRING, required): The key of the **vision-capable** LM Studio model. Default: `qwen2-vl-2b-instruct`.
 -   `system_prompt` (STRING, required): System prompt for the AI. Default: "This is a chat between a user and an assistant. The assistant is an expert in describing images, with detail and accuracy".
 -   `seed` (INT, required): Seed for reproducibility (-1 for random). Default: -1.
--   `image` (IMAGE, required): The input image to be described.
+-   `image` (IMAGE, required): The input image, or a batch of images, to be described. When a batch is connected, all images are sent to the model together (useful for multi-image comparison/description with vision models that support it).
 -   `user_prompt` (STRING, optional): The prompt asking about the image. Default: "Describe this image in detail".
 -   `max_tokens` (INT, optional): Max tokens for the response. Default: 1000.
 -   `temperature` (FLOAT, optional): Generation temperature. Default: 0.7.
