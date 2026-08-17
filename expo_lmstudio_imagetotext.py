@@ -41,11 +41,69 @@ DEFAULT_VISION = "qwen/qwen3-vl-8b"
 # No longer checking SDK compatibility
 
 # --- Helper for SDK-native reasoning stripping via respond_stream ---
-_THINK_TAG_RE = re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE)
+_THINK_TAG_RES = (
+    re.compile(r'<think>.*?</think>', re.DOTALL | re.IGNORECASE),
+    # Gemma emits its reasoning on a "thought" channel rather than in <think> tags
+    re.compile(r'<\|channel>thought.*?<channel\|>', re.DOTALL | re.IGNORECASE),
+)
 
 def _strip_think_tags(text: str) -> str:
-    """Remove all <think>...</think> blocks and strip surrounding whitespace."""
-    return _THINK_TAG_RE.sub('', text).strip()
+    """Remove all reasoning blocks and strip surrounding whitespace."""
+    for pattern in _THINK_TAG_RES:
+        text = pattern.sub('', text)
+    return text.strip()
+
+# --- Thinking-mode (reasoning) control ---
+# LM Studio's prediction config has no per-request reasoning switch, so thinking
+# mode is toggled with the soft-switch token the model family understands,
+# injected into the user turn (the system prompt does not reliably trigger it).
+# Each entry maps a model_key substring to (on_token, off_token, position).
+_DEFAULT_THINKING_SWITCH = ("/think", "/no_think", "suffix")
+_THINKING_SWITCHES = (
+    ("gemma", ("<|think|>", "", "prefix")),
+    ("qwen", ("/think", "/no_think", "suffix")),
+)
+
+
+def _thinking_switch_for(model_key):
+    """Pick the soft-switch tokens for a model key, falling back to the Qwen-style pair."""
+    key = str(model_key or "").lower()
+    for name, switch in _THINKING_SWITCHES:
+        if name in key:
+            return switch
+    return _DEFAULT_THINKING_SWITCH
+
+
+def _apply_thinking_mode(user_text, model_key, thinking_mode, thinking_trigger="", debug=False):
+    """
+    Return user_text with the model's thinking soft-switch injected.
+
+    thinking_mode is "default" (leave the prompt alone and use whatever LM Studio
+    has configured for the model), "on", or "off". A non-empty thinking_trigger
+    overrides the auto-detected token.
+    """
+    mode = str(thinking_mode or "default").lower()
+    text = str(user_text or "")
+    if mode not in ("on", "off"):
+        return text
+
+    on_token, off_token, position = _thinking_switch_for(model_key)
+    token = str(thinking_trigger or "").strip() or (on_token if mode == "on" else off_token)
+    if not token:
+        if debug:
+            print(f"Debug: No thinking '{mode}' token for model '{model_key}', prompt left unchanged")
+        return text
+    if token in text:
+        if debug:
+            print(f"Debug: Thinking token '{token}' already present in prompt")
+        return text
+
+    text = text.strip()
+    injected = f"{token} {text}".strip() if position == "prefix" else f"{text} {token}".strip()
+    if debug:
+        print(f"Debug: Thinking mode '{mode}' -> injected '{token}' as {position}")
+    return injected
+
 
 def _collect_response(model_obj, chat, config, strip_thinking):
     """
@@ -247,6 +305,8 @@ class ExpoLmstudioUnified:
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
                 "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
+                "thinking_mode": (["default", "on", "off"], {"default": "default", "tooltip": "Toggle the model's thinking/reasoning mode. 'default' leaves the prompt untouched and uses LM Studio's own model setting; 'on'/'off' inject the soft-switch token for the model family (<|think|> for Gemma, /think and /no_think for Qwen and others) into the user message."}),
+                "thinking_trigger": ("STRING", {"default": "", "tooltip": "Optional override for the token thinking_mode injects. Leave blank to auto-detect from model_key."}),
             }
         }
 
@@ -256,9 +316,9 @@ class ExpoLmstudioUnified:
     CATEGORY = "ComfyExpo/LMStudio"
 
     @classmethod
-    def IS_CHANGED(cls, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
+    def IS_CHANGED(cls, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger=""):
         m = hashlib.sha256()
-        
+
         m.update(str(text_input).encode())
         m.update(str(system_prompt).encode())
         m.update(str(model_key).encode())
@@ -270,7 +330,9 @@ class ExpoLmstudioUnified:
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
         m.update(str(strip_thinking).encode())
-        
+        m.update(str(thinking_mode).encode())
+        m.update(str(thinking_trigger).encode())
+
         # Include image hash if present
         if image is not None:
             # Convert image to a hashable representation
@@ -279,7 +341,7 @@ class ExpoLmstudioUnified:
         
         return m.hexdigest()
 
-    def process_input(self, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
+    def process_input(self, text_input, system_prompt, model_key, auto_unload, unload_delay, seed, image=None, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger=""):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
         strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
@@ -293,6 +355,10 @@ class ExpoLmstudioUnified:
         # If no inputs are provided, return a message
         if not has_image and not has_text:
             return ("No inputs provided. Please connect an image or provide text input.",)
+
+        # Toggle the model's thinking mode (no-op when thinking_mode is "default")
+        user_text = _apply_thinking_mode(text_input, model_key, thinking_mode, thinking_trigger, debug)
+        has_text = user_text.strip() != ""
 
         # Set seed
         if seed == -1:
@@ -345,7 +411,7 @@ class ExpoLmstudioUnified:
 
                     # Add user message with correct signature per SDK docs
                     if has_text:
-                        chat.add_user_message(text_input, images=[image_handle])
+                        chat.add_user_message(user_text, images=[image_handle])
                         if debug:
                             print(f"Debug: Added text and image to chat message")
                     else:
@@ -354,7 +420,7 @@ class ExpoLmstudioUnified:
                             print(f"Debug: Added image only to chat message")
                 elif has_text:
                     # Add user message with text only
-                    chat.add_user_message(text_input)
+                    chat.add_user_message(user_text)
                     if debug:
                         print(f"Debug: Added text only to chat message")
 
@@ -442,6 +508,8 @@ class ExpoLmstudioImageToText:
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
                 "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
+                "thinking_mode": (["default", "on", "off"], {"default": "default", "tooltip": "Toggle the model's thinking/reasoning mode. 'default' leaves the prompt untouched and uses LM Studio's own model setting; 'on'/'off' inject the soft-switch token for the model family (<|think|> for Gemma, /think and /no_think for Qwen and others) into the user message."}),
+                "thinking_trigger": ("STRING", {"default": "", "tooltip": "Optional override for the token thinking_mode injects. Leave blank to auto-detect from model_key."}),
                 # Legacy parameters for backward compatibility
                 "model": ("STRING", {"default": ""}),  # Old parameter name
                 "ip_address": ("STRING", {"default": ""}),  # Legacy HTTP mode
@@ -455,7 +523,7 @@ class ExpoLmstudioImageToText:
     CATEGORY = "ComfyExpo/I2T"
 
     @classmethod
-    def IS_CHANGED(cls, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
+    def IS_CHANGED(cls, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger="", model="", ip_address="", port=0):
         m = hashlib.sha256()
         
         m.update(str(user_prompt).encode())
@@ -469,10 +537,12 @@ class ExpoLmstudioImageToText:
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
         m.update(str(strip_thinking).encode())
+        m.update(str(thinking_mode).encode())
+        m.update(str(thinking_trigger).encode())
         m.update(str(model).encode())
         m.update(str(ip_address).encode())
         m.update(str(port).encode())
-        
+
         # Include image hash
         if image is not None:
             image_bytes = np.array(image).tobytes()
@@ -480,16 +550,20 @@ class ExpoLmstudioImageToText:
         
         return m.hexdigest()
 
-    def process_image(self, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
+    def process_image(self, image, user_prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger="", model="", ip_address="", port=0):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
+        strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
         # Handle backward compatibility
         # If legacy parameters are provided, show a deprecation warning and try to use them
         if model and not model_key:
             model_key = model
             if debug:
                 print("Debug: Using legacy 'model' parameter as 'model_key'")
-        
+
+        # Toggle the model's thinking mode (no-op when thinking_mode is "default")
+        user_prompt = _apply_thinking_mode(user_prompt, model_key or model, thinking_mode, thinking_trigger, debug)
+
         if ip_address and port > 0:
             # Legacy HTTP mode detected
             return self._process_image_legacy_http(image, user_prompt, system_prompt, model_key or model, ip_address, port, seed, max_tokens, temperature, debug)
@@ -715,6 +789,8 @@ class ExpoLmstudioTextGeneration:
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
                 "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
+                "thinking_mode": (["default", "on", "off"], {"default": "default", "tooltip": "Toggle the model's thinking/reasoning mode. 'default' leaves the prompt untouched and uses LM Studio's own model setting; 'on'/'off' inject the soft-switch token for the model family (<|think|> for Gemma, /think and /no_think for Qwen and others) into the user message."}),
+                "thinking_trigger": ("STRING", {"default": "", "tooltip": "Optional override for the token thinking_mode injects. Leave blank to auto-detect from model_key."}),
                 # Legacy parameters for backward compatibility
                 "model": ("STRING", {"default": ""}),  # Old parameter name
                 "ip_address": ("STRING", {"default": ""}),  # Legacy HTTP mode
@@ -728,7 +804,7 @@ class ExpoLmstudioTextGeneration:
     CATEGORY = "ComfyExpo/Text"
 
     @classmethod
-    def IS_CHANGED(cls, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
+    def IS_CHANGED(cls, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger="", model="", ip_address="", port=0):
         m = hashlib.sha256()
         
         m.update(str(prompt).encode())
@@ -742,13 +818,15 @@ class ExpoLmstudioTextGeneration:
         m.update(str(debug).encode())
         m.update(str(timeout_seconds).encode())
         m.update(str(strip_thinking).encode())
+        m.update(str(thinking_mode).encode())
+        m.update(str(thinking_trigger).encode())
         m.update(str(model).encode())
         m.update(str(ip_address).encode())
         m.update(str(port).encode())
-        
+
         return m.hexdigest()
 
-    def generate_text(self, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, model="", ip_address="", port=0):
+    def generate_text(self, prompt, system_prompt, model_key, auto_unload, unload_delay, seed, max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True, thinking_mode="default", thinking_trigger="", model="", ip_address="", port=0):
         # Normalize debug: accept both bool (BOOLEAN widget) and string (legacy/fallback)
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
         strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
@@ -758,7 +836,10 @@ class ExpoLmstudioTextGeneration:
             model_key = model
             if debug:
                 print("Debug: Using legacy 'model' parameter as 'model_key'")
-        
+
+        # Toggle the model's thinking mode (no-op when thinking_mode is "default")
+        prompt = _apply_thinking_mode(prompt, model_key or model, thinking_mode, thinking_trigger, debug)
+
         if ip_address and port > 0:
             # Legacy HTTP mode detected
             return self._generate_text_legacy_http(prompt, system_prompt, model_key or model, ip_address, port, seed, max_tokens, temperature, debug)
@@ -966,6 +1047,8 @@ class ExpoLmstudioStructuredOutput:
                 "debug": ("BOOLEAN", {"default": False}),
                 "timeout_seconds": ("INT", {"default": 300, "min": 10, "max": 3600, "step": 1}),
                 "strip_thinking": ("BOOLEAN", {"default": True, "tooltip": "Strip <think>...</think> reasoning blocks from the response (for models with thinking mode enabled)."}),
+                "thinking_mode": (["default", "on", "off"], {"default": "default", "tooltip": "Toggle the model's thinking/reasoning mode. 'default' leaves the prompt untouched and uses LM Studio's own model setting; 'on'/'off' inject the soft-switch token for the model family (<|think|> for Gemma, /think and /no_think for Qwen and others) into the user message."}),
+                "thinking_trigger": ("STRING", {"default": "", "tooltip": "Optional override for the token thinking_mode injects. Leave blank to auto-detect from model_key."}),
             },
         }
 
@@ -977,11 +1060,13 @@ class ExpoLmstudioStructuredOutput:
     @classmethod
     def IS_CHANGED(cls, text_input, json_schema, output_keys, system_prompt, model_key,
                    auto_unload, unload_delay, seed, image=None,
-                   max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True):
+                   max_tokens=1000, temperature=0.7, debug=False, timeout_seconds=300, strip_thinking=True,
+                   thinking_mode="default", thinking_trigger=""):
         import json as _json
         m = hashlib.sha256()
         for val in (text_input, json_schema, output_keys, system_prompt, model_key,
-                    auto_unload, unload_delay, seed, max_tokens, temperature, debug, timeout_seconds, strip_thinking):
+                    auto_unload, unload_delay, seed, max_tokens, temperature, debug, timeout_seconds, strip_thinking,
+                    thinking_mode, thinking_trigger):
             m.update(str(val).encode())
         if image is not None:
             m.update(np.array(image).tobytes())
@@ -990,12 +1075,16 @@ class ExpoLmstudioStructuredOutput:
     def generate_structured(self, text_input, json_schema, output_keys, system_prompt,
                             model_key, auto_unload, unload_delay, seed,
                             image=None, max_tokens=1000, temperature=0.7,
-                            debug=False, timeout_seconds=300, strip_thinking=True):
+                            debug=False, timeout_seconds=300, strip_thinking=True,
+                            thinking_mode="default", thinking_trigger=""):
         import json as _json
 
         debug = debug if isinstance(debug, bool) else str(debug).lower() == "true"
         strip_thinking = strip_thinking if isinstance(strip_thinking, bool) else str(strip_thinking).lower() == "true"
         check_lmstudio_connection()
+
+        # Toggle the model's thinking mode (no-op when thinking_mode is "default")
+        text_input = _apply_thinking_mode(text_input, model_key, thinking_mode, thinking_trigger, debug)
 
         # Parse the schema
         try:

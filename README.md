@@ -32,6 +32,7 @@ Here's an example of how the LM Studio nodes can be used in a ComfyUI workflow:
 -   Setup node provides guidance for installing the SDK and getting models.
 -   Customizable system prompts for context setting.
 -   Control over generation parameters like `max_tokens`, `temperature`, and `seed`.
+-   **Thinking mode toggle** for hybrid reasoning models (Gemma 4, Qwen 3, …) — see [Thinking / Reasoning Mode](#thinking--reasoning-mode).
 -   Optional streaming output for the Text Generation node.
 -   Debug mode for detailed console logging.
 -   Automatic connection to the LM Studio server (no need to specify IP/Port in nodes).
@@ -268,6 +269,42 @@ template: Generate artwork combining {item}.
 ```
 
 Output prompt: `Generate artwork combining watercolour, impressionist, cyberpunk.`
+
+---
+
+## Thinking / Reasoning Mode
+
+Hybrid reasoning models (Gemma 4, Qwen 3, and friends) can answer with or without an
+internal thinking pass. The **LM Studio Unified**, **I2T**, **Text Gen**, and
+**Structured Output** nodes each expose two optional inputs for this:
+
+-   `thinking_mode` (`default` | `on` | `off`, default `default`)
+-   `thinking_trigger` (STRING, default empty)
+
+LM Studio's prediction API has no per-request reasoning switch, so `on`/`off` work the
+way the models themselves do — by injecting the family's soft-switch token into the
+**user** message (the system prompt does not reliably trigger it). The token is picked
+from `model_key`:
+
+| Model family | `on` | `off` |
+| --- | --- | --- |
+| `gemma*` | `<|think|>` prefix | no token (Gemma is non-thinking by default) |
+| `qwen*` and anything else | ` /think` suffix | ` /no_think` suffix |
+
+`default` leaves the prompt completely untouched, so whatever you have configured for
+the model inside LM Studio wins. Set `thinking_trigger` to override the injected token
+for a model the auto-detection doesn't know about; it replaces the token for whichever
+mode is selected. Enable `debug` to see exactly what was injected.
+
+Turning thinking on does not change the node's output format — `strip_thinking`
+(default on) still removes the reasoning from the returned text, covering both
+`<think>…</think>` blocks and Gemma's `<|channel>thought…<channel|>` output. Turn
+`strip_thinking` off if you want the reasoning in the output string.
+
+> **Gemma 4 note:** for the reasoning to be parsed out cleanly by LM Studio itself,
+> also enable *Reasoning Parsing* in the model's settings (start string
+> `<|channel>thought`, end string `<channel|>`). Without it the node falls back to
+> stripping the block with a regex.
 
 ---
 
